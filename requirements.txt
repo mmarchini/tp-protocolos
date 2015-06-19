@@ -1,0 +1,14 @@
+Routes==2.1
+WebOb==1.4.1
+argparse==1.2.1
+eventlet==0.17.4
+greenlet==0.4.7
+msgpack-python==0.4.6
+netaddr==0.7.14
+oslo.config==1.12.1
+pbr==1.1.1
+repoze.lru==0.6
+ryu==3.22
+six==1.9.0
+stevedore==1.5.0
+wsgiref==0.1.2
