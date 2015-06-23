@@ -28,7 +28,7 @@ from ryu.lib import dpid as dpid_lib
 from ryu.lib import stplib, hub
 from ryu.lib.mac import haddr_to_str
 
-import topology
+#import topology
 
 def generate_config(bridges):
     config = {}
@@ -59,19 +59,31 @@ class SimpleSwitchStp(app_manager.RyuApp):
         self._disabler = hub.spawn(self.disabler)
 
     def disabler(self,):
+        this_minute = datetime.now().minute
+        elapsed_time = 0
+        enabled = True        
+
         while True:
             greenthread.sleep(1)
+            what_to_disable = [10, 9, 8]            
 
-            last_minute = datetime.now().minute
-            what_to_disable = [10, 9, 8]
-            if last_minute%2 == 0:
-                for dpid in filter(self.switch_enabled, what_to_disable):
-                    self.logger.info("Trying to disable switch %d", dpid)
-                    self.disable_switch(dpid)
-            else:
-                for dpid in filter(self.switch_disabled, what_to_disable):
-                    self.logger.info("Trying to enable switch %d", dpid)
-                    self.enable_switch(dpid)
+            last_minute = this_minute 
+            this_minute = datetime.now().minute
+            if last_minute < this_minute:
+                elapsed_time = elapsed_time + 1
+
+            if elapsed_time == 3:
+                elapsed_time = 0
+                if enabled:
+                    enabled = False
+                    for dpid in filter(self.switch_enabled, what_to_disable):
+                        self.logger.info("Trying to disable switch %d", dpid)
+                        self.disable_switch(dpid)
+                else:
+                    enabled = True
+                    for dpid in filter(self.switch_disabled, what_to_disable):
+                        self.logger.info("Trying to enable switch %d", dpid)
+                        self.enable_switch(dpid)
 
     def add_flow(self, datapath, in_port, dst, actions):
         ofproto = datapath.ofproto
