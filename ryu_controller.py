@@ -64,15 +64,19 @@ class SimpleSwitchStp(app_manager.RyuApp):
         enabled = True        
 
         while True:
-            greenthread.sleep(1)
-            what_to_disable = [10, 9, 8]            
+            greenthread.sleep(20)
+            what_to_disable = [10, 9, 8]           
+            print "ainda no loop =====================================" 
 
             last_minute = this_minute 
             this_minute = datetime.now().minute
             if last_minute < this_minute:
                 elapsed_time = elapsed_time + 1
+                print "1 minute gone ================================= this_minute =", this_minute, "last_minute =", last_minute
+            else:
+                print "waitin ======================================== this_minute =", this_minute, "last_minute =", last_minute
 
-            if elapsed_time == 3:
+            if elapsed_time == 2:
                 elapsed_time = 0
                 if enabled:
                     enabled = False
@@ -84,6 +88,8 @@ class SimpleSwitchStp(app_manager.RyuApp):
                     for dpid in filter(self.switch_disabled, what_to_disable):
                         self.logger.info("Trying to enable switch %d", dpid)
                         self.enable_switch(dpid)
+                print "saiu ========================================="
+                
 
     def add_flow(self, datapath, in_port, dst, actions):
         ofproto = datapath.ofproto
