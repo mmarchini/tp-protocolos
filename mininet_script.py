@@ -75,10 +75,6 @@ def evalTopo():
 
   net.start()
 
-  # Start HTTP server on hosts 10.0.0.1 and 10.0.0.3
-  h1.sendCmd("cd webpage && python -m SimpleHTTPServer 80 &")
-  h3.sendCmd("cd webpage && python -m SimpleHTTPServer 80 &")
-
   CLI( net )
 
   net.stop()
