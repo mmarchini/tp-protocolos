@@ -32,49 +32,54 @@
 An OpenFlow 1.0 shortest path forwarding implementation.
 """
 
-import time
-import struct
-import logging
+# import time
 from datetime import datetime
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER
+from ryu.controller.handler import MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_0
+from ryu.lib import mac
 from ryu.lib.mac import haddr_to_bin
 from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet, ipv4, ipv6
+from ryu.lib.packet import ethernet, ipv6, arp
 
-from ryu.topology.api import get_switch, get_link
-from ryu.app.wsgi import ControllerBase
-from ryu.topology import event, switches
+# from ryu.topology.api import get_switch, get_link
+# from ryu.app.wsgi import ControllerBase
+# from ryu.topology import event, switches
 import networkx as nx
 
-class BufferID(object):
+nodes = range(1, 11) + map(lambda i: "00:04:00:00:00:0%d"%i, range(1, 8))
+edges = [
+    #
+    (1, "00:04:00:00:00:01",{'port':1}),
+    (2, "00:04:00:00:00:02",{'port':1}),
+    (3, "00:04:00:00:00:03",{'port':1}),
+    (4, "00:04:00:00:00:04",{'port':1}),
+    (5, "00:04:00:00:00:05",{'port':1}),
+    (6, "00:04:00:00:00:06",{'port':1}),
+    (7, "00:04:00:00:00:07",{'port':1}),
+    #
+    (1,  2,{'port':2}),(2,  1,{'port':2}),
+    (1,  7,{'port':3}),(7,  1,{'port':2}),
+    (1,  8,{'port':4}),(8,  1,{'port':1}),
+    (1, 10,{'port':5}),(10, 1,{'port':1}),
+    (2, 10,{'port':3}),(10, 2,{'port':2}),
+    (2,  3,{'port':4}),(3,  2,{'port':2}),
+    (3,  9,{'port':3}),(9,  3,{'port':1}),
+    (3,  4,{'port':4}),(4,  3,{'port':2}),
+    (4,  5,{'port':3}),(5,  4,{'port':2}),
+    (4,  8,{'port':4}),(8,  4,{'port':2}),
+    (5,  6,{'port':3}),(6,  5,{'port':2}),
+    (5,  7,{'port':4}),(7,  5,{'port':3}),
+    (6,  7,{'port':3}),(7,  6,{'port':4}),
+    (7,  8,{'port':5}),(8,  7,{'port':3}),
+    (8,  9,{'port':4}),(9,  8,{'port':2}),
+    (8, 10,{'port':5}),(10, 8,{'port':3}),
+    (9, 10,{'port':3}),(10, 9,{'port':4}),
+]
 
-    def __init__(self, value):
-        self.buffer_id = value
-
-    @property
-    def buffer_id(self):
-        return self._buffer_id
-
-    @buffer_id.setter
-    def buffer_id(self, value):
-        self.timestamp = time.time()
-        self._buffer_id = value
-
-    @classmethod
-    def cleanup(self, _dict, timeout=120):
-        now = time.time()
-        bids = []
-        for bid in _dict:
-            if now-bid.timestamp < timeout:
-                bids.append(bid)
-        for bid in bids:
-            del _dict[bid]
-        return _dict
 
 def timestamp():
     return "[%02d:%02d:%02d]"%datetime.now().timetuple()[3:6]
@@ -87,10 +92,18 @@ class ProjectController(app_manager.RyuApp):
         super(ProjectController, self).__init__(*args, **kwargs)
         self.topology_api_app = self
         self.net=nx.DiGraph()
-        self.nodes = {}
-        self.links = {}
-
-        self.avoid_loop = {}
+        self.net.add_nodes_from(nodes)
+        self.net.add_edges_from(edges)
+        self.arp_table = {
+            "10.0.0.1":"00:04:00:00:00:01",
+            "10.0.0.2":"00:04:00:00:00:02",
+            "10.0.0.3":"00:04:00:00:00:03",
+            "10.0.0.4":"00:04:00:00:00:04",
+            "10.0.0.5":"00:04:00:00:00:05",
+            "10.0.0.6":"00:04:00:00:00:06",
+            "10.0.0.7":"00:04:00:00:00:07"
+        }
+        self.sw = {}
 
     def add_flow(self, datapath, in_port, dst, actions):
         ofproto = datapath.ofproto
@@ -105,19 +118,6 @@ class ProjectController(app_manager.RyuApp):
             flags=ofproto.OFPFF_SEND_FLOW_REM, actions=actions)
         datapath.send_msg(mod)
 
-    def skip_packet(self, buffer_id, dpid):
-        BufferID.cleanup(self.avoid_loop)
-        bid = filter(lambda b: b.buffer_id == buffer_id, [bid for bid in self.avoid_loop])
-        if len(bid) == 0:
-            bid = BufferID(buffer_id)
-            self.avoid_loop[bid] = [dpid]
-            return False
-        bid = bid[0]
-        if dpid in self.avoid_loop[bid]:
-            return True
-        self.avoid_loop[bid].append(dpid)
-        return False
-
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
@@ -130,9 +130,15 @@ class ProjectController(app_manager.RyuApp):
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
-        if msg.buffer_id != ofproto.OFP_NO_BUFFER and self.skip_packet(msg.buffer_id, dpid):
-            self.logger.info("%s DROP %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
-            return
+
+        if pkt.get_protocol(ipv6.ipv6):  # Drop the IPV6 Packets.
+            return None
+
+        arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt:
+            self.logger.info("ARP RECIEVED")
+            self.arp_table[arp_pkt.src_ip] = src  # ARP learning
+
         if src not in self.net:
             self.logger.info("%s >> %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
             self.net.add_node(src)
@@ -141,38 +147,87 @@ class ProjectController(app_manager.RyuApp):
         if dst in self.net:
             self.logger.info("%s << %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
 
-            path=nx.shortest_path(self.net,src,dst)
-            next=path[path.index(dpid)+1]
+            self.net.edges()
+            path=nx.shortest_path(self.net,dpid,dst)
+            next=path[1]
             out_port=self.net[dpid][next]['port']
         else:
-            self.logger.info("%s FLOOD %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
-            out_port = ofproto.OFPP_FLOOD
+            if self.arp_handler(msg):  # 1:reply or drop;  0: flood
+                return None
+            else:
+                self.logger.info("%s FLOOD %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
+                out_port = ofproto.OFPP_FLOOD
 
         actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
 
-        # WE WANT PACKET_IN TO AVOID LOOPS
         # install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:
             self.add_flow(datapath, msg.in_port, dst, actions)
-
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
 
         out = datapath.ofproto_parser.OFPPacketOut(
             datapath=datapath, buffer_id=msg.buffer_id, in_port=msg.in_port,
             actions=actions)
         datapath.send_msg(out)
 
-    @set_ev_cls(event.EventSwitchEnter)
-    def get_topology_data(self, ev):
-        switch_list = get_switch(self.topology_api_app, None)
-        switches=[switch.dp.id for switch in switch_list]
-        self.net.add_nodes_from(switches)
+    def arp_handler(self, msg):
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        in_port = msg.in_port
 
-        links_list = get_link(self.topology_api_app, None)
-        links=[(link.src.dpid,link.dst.dpid,{'port':link.src.port_no}) for link in links_list]
-        self.net.add_edges_from(links)
-        links=[(link.dst.dpid,link.src.dpid,{'port':link.dst.port_no}) for link in links_list]
-        self.net.add_edges_from(links)
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocols(ethernet.ethernet)[0]
+        arp_pkt = pkt.get_protocol(arp.arp)
+
+        if eth:
+            eth_dst = eth.dst
+            eth_src = eth.src
+
+        # Break the loop for avoiding ARP broadcast storm
+        if eth_dst == mac.BROADCAST_STR and arp_pkt:
+            arp_dst_ip = arp_pkt.dst_ip
+
+            if (datapath.id, eth_src, arp_dst_ip) in self.sw:
+                if self.sw[(datapath.id, eth_src, arp_dst_ip)] != in_port:
+                    datapath.send_packet_out(in_port=in_port, actions=[])
+                    return True
+            else:
+                self.sw[(datapath.id, eth_src, arp_dst_ip)] = in_port
+
+        # Try to reply arp request
+        if arp_pkt:
+            # hwtype = arp_pkt.hwtype
+            # proto = arp_pkt.proto
+            # hlen = arp_pkt.hlen
+            # plen = arp_pkt.plen
+            opcode = arp_pkt.opcode
+            arp_src_ip = arp_pkt.src_ip
+            arp_dst_ip = arp_pkt.dst_ip
+
+            if opcode == arp.ARP_REQUEST:
+                if arp_dst_ip in self.arp_table:
+                    actions = [parser.OFPActionOutput(in_port)]
+                    ARP_Reply = packet.Packet()
+
+                    ARP_Reply.add_protocol(ethernet.ethernet(
+                        ethertype=eth.ethertype,
+                        dst=eth_src,
+                        src=self.arp_table[arp_dst_ip]))
+                    ARP_Reply.add_protocol(arp.arp(
+                        opcode=arp.ARP_REPLY,
+                        src_mac=self.arp_table[arp_dst_ip],
+                        src_ip=arp_dst_ip,
+                        dst_mac=eth_src,
+                        dst_ip=arp_src_ip))
+
+                    ARP_Reply.serialize()
+
+                    out = parser.OFPPacketOut(
+                        datapath=datapath,
+                        buffer_id=ofproto.OFP_NO_BUFFER,
+                        in_port=ofproto.OFPP_CONTROLLER,
+                        actions=actions, data=ARP_Reply.data)
+                    datapath.send_msg(out)
+                    return True
+        return False
 
