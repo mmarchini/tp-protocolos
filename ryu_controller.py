@@ -1,38 +1,16 @@
-#  This is part of our final project for the Computer Networks Graduate Course at Georgia Tech
-#    You can take the official course online too! Just google CS 6250 online at Georgia Tech.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 #
-#  Contributors:
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
 #
-#    Akshar Rawal (arawal@gatech.edu)
-#    Flavio Castro (castro.flaviojr@gmail.com)
-#    Logan Blyth (lblyth3@gatech.edu)
-#    Matthew Hicks (mhicks34@gatech.edu)
-#    Uy Nguyen (unguyen3@gatech.edu)
-#
-#  To run:
-#
-#    ryu--manager --observe-links shortestpath.py
-#
-#Copyright (C) 2014, Georgia Institute of Technology.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-# implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-"""
-An OpenFlow 1.0 shortest path forwarding implementation.
-"""
-
-# import time
 from datetime import datetime
 
 from eventlet import greenthread, semaphore
@@ -47,9 +25,6 @@ from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet, ipv6, arp
 from ryu.lib import hub
 
-# from ryu.topology.api import get_switch, get_link
-# from ryu.app.wsgi import ControllerBase
-# from ryu.topology import event, switches
 import networkx as nx
 
 green_nodes = range(1, 11) + map(lambda i: "00:04:00:00:00:0%d"%i, range(1, 8))
