@@ -35,6 +35,7 @@ An OpenFlow 1.0 shortest path forwarding implementation.
 # import time
 from datetime import datetime
 
+from eventlet import greenthread, semaphore
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER
@@ -44,14 +45,15 @@ from ryu.lib import mac
 from ryu.lib.mac import haddr_to_bin
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet, ipv6, arp
+from ryu.lib import hub
 
 # from ryu.topology.api import get_switch, get_link
 # from ryu.app.wsgi import ControllerBase
 # from ryu.topology import event, switches
 import networkx as nx
 
-nodes = range(1, 11) + map(lambda i: "00:04:00:00:00:0%d"%i, range(1, 8))
-edges = [
+green_nodes = range(1, 11) + map(lambda i: "00:04:00:00:00:0%d"%i, range(1, 8))
+green_edges = [
     #
     (1, "00:04:00:00:00:01",{'port':1}),
     (2, "00:04:00:00:00:02",{'port':1}),
@@ -80,6 +82,29 @@ edges = [
     (9, 10,{'port':3}),(10, 9,{'port':4}),
 ]
 
+red_nodes = range(1, 8) + map(lambda i: "00:04:00:00:00:0%d"%i, range(1, 8))
+red_edges = [
+    #
+    (1, "00:04:00:00:00:01",{'port':1}),
+    (2, "00:04:00:00:00:02",{'port':1}),
+    (3, "00:04:00:00:00:03",{'port':1}),
+    (4, "00:04:00:00:00:04",{'port':1}),
+    (5, "00:04:00:00:00:05",{'port':1}),
+    (6, "00:04:00:00:00:06",{'port':1}),
+    (7, "00:04:00:00:00:07",{'port':1}),
+    #
+    (1,  2,{'port':2}),(2,  1,{'port':2}),
+    (1,  7,{'port':3}),(7,  1,{'port':2}),
+    (2,  3,{'port':4}),(3,  2,{'port':2}),
+    (3,  4,{'port':4}),(4,  3,{'port':2}),
+    (4,  5,{'port':3}),(5,  4,{'port':2}),
+    (5,  6,{'port':3}),(6,  5,{'port':2}),
+    (5,  7,{'port':4}),(7,  5,{'port':3}),
+    (6,  7,{'port':3}),(7,  6,{'port':4}),
+]
+
+GREEN = 1
+RED   = 0
 
 def timestamp():
     return "[%02d:%02d:%02d]"%datetime.now().timetuple()[3:6]
@@ -91,9 +116,17 @@ class ProjectController(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(ProjectController, self).__init__(*args, **kwargs)
         self.topology_api_app = self
-        self.net=nx.DiGraph()
-        self.net.add_nodes_from(nodes)
-        self.net.add_edges_from(edges)
+        self.green_net=nx.DiGraph()
+        self.green_net.add_nodes_from(green_nodes)
+        self.green_net.add_edges_from(green_edges)
+
+        self.red_net=nx.DiGraph()
+        self.red_net.add_nodes_from(red_nodes)
+        self.red_net.add_edges_from(red_edges)
+
+        self.net = self.green_net
+        self.status = GREEN
+
         self.arp_table = {
             "10.0.0.1":"00:04:00:00:00:01",
             "10.0.0.2":"00:04:00:00:00:02",
@@ -105,18 +138,58 @@ class ProjectController(app_manager.RyuApp):
         }
         self.sw = {}
 
+        self.dps = {}
+        self.dps_sem = semaphore.Semaphore(1)
+
+        self._disabler = hub.spawn(self.disabler)
+
+    def disabler(self,):
+        while True:
+            greenthread.sleep(60)
+
+            if self.status == GREEN:
+                self.logger.info("%s Let's put %s to sleep", timestamp(), range(8, 11))
+                self.net    = self.red_net
+                self.status = RED
+                self.clean_tables()
+            else:
+                self.logger.info("%s Let's awake %s", timestamp(), range(8, 11))
+                self.net = self.green_net
+                self.status = GREEN
+                self.clean_tables()
+
+    def clean_tables(self):
+        with self.dps_sem:
+            for datapath in self.dps.values():
+                ofproto = datapath.ofproto
+
+                wildcards = ofproto_v1_0.OFPFW_ALL
+                match = datapath.ofproto_parser.OFPMatch(
+                    wildcards, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+                mod = datapath.ofproto_parser.OFPFlowMod(
+                    datapath=datapath, match=match, cookie=0,
+                    command=ofproto.OFPFC_DELETE)
+                datapath.send_msg(mod)
+            self.dps.clear()
+
+
     def add_flow(self, datapath, in_port, dst, actions):
-        ofproto = datapath.ofproto
+        with self.dps_sem:
+            dpid = datapath.id
+            if not dpid in self.dps:
+                self.dps[dpid] = datapath
+            ofproto = datapath.ofproto
 
-        match = datapath.ofproto_parser.OFPMatch(
-            in_port=in_port, dl_dst=haddr_to_bin(dst))
+            match = datapath.ofproto_parser.OFPMatch(
+                in_port=in_port, dl_dst=haddr_to_bin(dst))
 
-        mod = datapath.ofproto_parser.OFPFlowMod(
-            datapath=datapath, match=match, cookie=0,
-            command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=0,
-            priority=ofproto.OFP_DEFAULT_PRIORITY,
-            flags=ofproto.OFPFF_SEND_FLOW_REM, actions=actions)
-        datapath.send_msg(mod)
+            mod = datapath.ofproto_parser.OFPFlowMod(
+                datapath=datapath, match=match, cookie=0,
+                command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=0,
+                priority=ofproto.OFP_DEFAULT_PRIORITY,
+                flags=ofproto.OFPFF_SEND_FLOW_REM, actions=actions)
+            datapath.send_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
@@ -196,10 +269,6 @@ class ProjectController(app_manager.RyuApp):
 
         # Try to reply arp request
         if arp_pkt:
-            # hwtype = arp_pkt.hwtype
-            # proto = arp_pkt.proto
-            # hlen = arp_pkt.hlen
-            # plen = arp_pkt.plen
             opcode = arp_pkt.opcode
             arp_src_ip = arp_pkt.src_ip
             arp_dst_ip = arp_pkt.dst_ip
