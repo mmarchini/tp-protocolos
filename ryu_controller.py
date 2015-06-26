@@ -30,7 +30,6 @@ from ryu.lib import hub
 
 # Biblioteca que provê funcionalidades para a rede (cálculo de menor caminho)
 import networkx as nx
-import matplotlib.pyplot as plt
 
 # Estados da topologia
 GREEN = 'green' # Topologia completa
@@ -63,13 +62,16 @@ class ProjectController(app_manager.RyuApp):
 
         self.name = "project_controller"
 
+        # Estruturas necessárias para realizar descoberta dos vizinhos
+        # utilizando LLDP
         self._lldp = kwargs["switches"]
         self.switches = []
         self.links = []
 
+        # Lista com os switches "desabilitáveis"
         self.what_to_disable = [8, 9, 10]
 
-        # Marca a topologia completa como sendo a topologia atual
+        # Inicializa a estrutura que mantém o grafo da rede atualizada
         self.net = nx.DiGraph()
         self.status = GREEN
         self.status_sem = semaphore.Semaphore(1)
@@ -81,9 +83,6 @@ class ProjectController(app_manager.RyuApp):
         # Inicializa a cache de datapaths (usada para deletar os flows)
         self.dps = {}
         self.dps_sem = semaphore.Semaphore(1)
-
-        # Inicializa a cache utilizada para evitar loop em pacotes broadcast
-        self.avoid_loop = {}
 
         # Inicializa a thread temporizadora
         self._disabler = hub.spawn(self.disabler)
@@ -105,10 +104,13 @@ class ProjectController(app_manager.RyuApp):
                 self.set_status(GREEN)
 
     def set_status(self, status):
+        """
+        Método responsável por realizar a troca de estado
+        """
         with self.status_sem:
-            self.net.clear()
-            self.status = status
-            self.clean_tables()
+            self.net.clear() # Limpa o grafo (para recalculá-lo no próximo PacketIn válido)
+            self.status = status # Altera o status
+            self.clean_tables() # Limpa as regras dos switches
 
     def clean_tables(self):
         """
@@ -166,13 +168,7 @@ class ProjectController(app_manager.RyuApp):
         deve ser descartado por algum motivo
         """
         datapath = msg.datapath
-
         pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocol(ethernet.ethernet)
-
-        dst = eth.dst
-        src = eth.src
-        in_port = msg.in_port
         dpid = datapath.id
 
         # Se a topologia está em modo econômico, ignora os switches
@@ -185,23 +181,17 @@ class ProjectController(app_manager.RyuApp):
             self.logger.debug("%s Switch %s dropped non supported package %s", timestamp(), dpid, pkt)
             return True
 
-        self.avoid_loop.setdefault(dpid, {})
-#       if dst == mac.BROADCAST_STR:
-#           if not self.avoid_loop[dpid].has_key(src):
-#               self.avoid_loop[dpid][src] = in_port
-#           if self.avoid_loop[dpid][src] != in_port:
-#               self.logger.info("%s Loop avoided on %s [src: %s, dst: %s, port: %s]",
-#                                timestamp(), dpid, src, dst, in_port)
-#               return True
-
         return False
 
     def initialize_graph(self):
+        # Se ainda não conhece os switches, pega do controlador LLDP
         if not self.switches:
             lldp = self._lldp
             lldp.close()
             app_manager.unregister_app(lldp)
+            # Desabilita o controlador LLDP após não precisar mais dele
 
+            # Obtém os dados do controlador LLDP para gerar a topologia
             switches = []
             for dp in lldp.dps.itervalues():
                 switches.append(lldp._get_switch(dp.id))
@@ -210,23 +200,21 @@ class ProjectController(app_manager.RyuApp):
             self.links = lldp.links
             self.logger.info("%s The following %s links were found: %s", timestamp(), len(self.links), [(l.src.dpid, l.dst.dpid)  for l in self.links])
 
+        # Define os switches como nodos do grafo
         switch_list = self.switches
         if self.status == RED:
             switch_list = filter(lambda s: s.dp.id not in self.what_to_disable, switch_list)
         switches=[switch.dp.id for switch in switch_list]
         self.net.add_nodes_from(switches)
 
+        # Define os links entre os switches como ligações entre os nodos do
+        # grafo, dando prioridade para os links para switches com dpid maior
         links_list = self.links
         if self.status == RED:
             links_list = filter(lambda l: l.src.dpid not in self.what_to_disable, links_list)
             links_list = filter(lambda l: l.dst.dpid not in self.what_to_disable, links_list)
         links=[(link.src.dpid,link.dst.dpid,{'port':link.src.port_no, "priority":len(switches)-link.dst.dpid+1}) for link in links_list]
         self.net.add_edges_from(links)
-
-        nx.draw(self.net, with_labels=True)
-
-        print reduce(lambda a, b: a.replace(b, ""), [":", "[", "]"], timestamp())
-        plt.savefig("graph.%s.png"%reduce(lambda a, b: a.replace(b, ""), [":", "[", "]"], timestamp()))
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
@@ -256,6 +244,7 @@ class ProjectController(app_manager.RyuApp):
                 self.logger.info("%s New ARP entry: [src: %s, %s]", timestamp(), arp_pkt.src_ip, src)
                 self.arp_table[arp_pkt.src_ip] = src  # ARP learning
 
+            # Inicializa o grafo se ele está vazio
             if not self.net.nodes():
                 self.initialize_graph()
 
