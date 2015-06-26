@@ -21,67 +21,15 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_0
+from ryu.topology import switches
 from ryu.lib import mac
 from ryu.lib.mac import haddr_to_bin
 from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet, ipv6, arp
+from ryu.lib.packet import ethernet, ipv6, arp, lldp
 from ryu.lib import hub
 
 # Biblioteca que provê funcionalidades para a rede (cálculo de menor caminho)
 import networkx as nx
-
-# Representação da topologia completa em forma de grafo
-green_nodes = range(1, 11) + map(lambda i: "00:04:00:00:00:0%d"%i, range(1, 8))
-green_edges = [
-    #
-    (1, "00:04:00:00:00:01",{'port':1}),
-    (2, "00:04:00:00:00:02",{'port':1}),
-    (3, "00:04:00:00:00:03",{'port':1}),
-    (4, "00:04:00:00:00:04",{'port':1}),
-    (5, "00:04:00:00:00:05",{'port':1}),
-    (6, "00:04:00:00:00:06",{'port':1}),
-    (7, "00:04:00:00:00:07",{'port':1}),
-    #
-    (1,  2,{'port':2}),(2,  1,{'port':2}),
-    (1,  7,{'port':3}),(7,  1,{'port':2}),
-    (1,  8,{'port':4}),(8,  1,{'port':1}),
-    (1, 10,{'port':5}),(10, 1,{'port':1}),
-    (2, 10,{'port':3}),(10, 2,{'port':2}),
-    (2,  3,{'port':4}),(3,  2,{'port':2}),
-    (3,  9,{'port':3}),(9,  3,{'port':1}),
-    (3,  4,{'port':4}),(4,  3,{'port':2}),
-    (4,  5,{'port':3}),(5,  4,{'port':2}),
-    (4,  8,{'port':4}),(8,  4,{'port':2}),
-    (5,  6,{'port':3}),(6,  5,{'port':2}),
-    (5,  7,{'port':4}),(7,  5,{'port':3}),
-    (6,  7,{'port':3}),(7,  6,{'port':4}),
-    (7,  8,{'port':5}),(8,  7,{'port':3}),
-    (8,  9,{'port':4}),(9,  8,{'port':2}),
-    (8, 10,{'port':5}),(10, 8,{'port':3}),
-    (9, 10,{'port':3}),(10, 9,{'port':4}),
-]
-
-# Representação da econômica em forma de grafo
-red_nodes = range(1, 8) + map(lambda i: "00:04:00:00:00:0%d"%i, range(1, 8))
-red_edges = [
-    #
-    (1, "00:04:00:00:00:01",{'port':1}),
-    (2, "00:04:00:00:00:02",{'port':1}),
-    (3, "00:04:00:00:00:03",{'port':1}),
-    (4, "00:04:00:00:00:04",{'port':1}),
-    (5, "00:04:00:00:00:05",{'port':1}),
-    (6, "00:04:00:00:00:06",{'port':1}),
-    (7, "00:04:00:00:00:07",{'port':1}),
-    #
-    (1,  2,{'port':2}),(2,  1,{'port':2}),
-    (1,  7,{'port':3}),(7,  1,{'port':2}),
-    (2,  3,{'port':4}),(3,  2,{'port':2}),
-    (3,  4,{'port':4}),(4,  3,{'port':2}),
-    (4,  5,{'port':3}),(5,  4,{'port':2}),
-    (5,  6,{'port':3}),(6,  5,{'port':2}),
-    (5,  7,{'port':4}),(7,  5,{'port':3}),
-    (6,  7,{'port':3}),(7,  6,{'port':4}),
-]
 
 # Estados da topologia
 GREEN = 'green' # Topologia completa
@@ -102,6 +50,7 @@ class ProjectController(app_manager.RyuApp):
     """
 
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
+    _CONTEXTS = {"switches":switches.Switches}
 
     def __init__(self, *args, **kwargs):
         """
@@ -111,19 +60,21 @@ class ProjectController(app_manager.RyuApp):
         """
         super(ProjectController, self).__init__(*args, **kwargs)
 
-        # Inicializa o grafo da topologia completa
-        self.green_net=nx.DiGraph()
-        self.green_net.add_nodes_from(green_nodes)
-        self.green_net.add_edges_from(green_edges)
+        self.name = "project_controller"
 
-        # Inicializa o grafo da topologia econômica
-        self.red_net=nx.DiGraph()
-        self.red_net.add_nodes_from(red_nodes)
-        self.red_net.add_edges_from(red_edges)
+        # Estruturas necessárias para realizar descoberta dos vizinhos
+        # utilizando LLDP
+        self._lldp = kwargs["switches"]
+        self.switches = []
+        self.links = []
 
-        # Marca a topologia completa como sendo a topologia atual
-        self.net = self.green_net
+        # Lista com os switches "desabilitáveis"
+        self.what_to_disable = [8, 9, 10]
+
+        # Inicializa a estrutura que mantém o grafo da rede atualizada
+        self.net = nx.DiGraph()
         self.status = GREEN
+        self.status_sem = semaphore.Semaphore(1)
 
         # Inicializa a tabela IP-MAC
         self.arp_table = {}
@@ -147,14 +98,19 @@ class ProjectController(app_manager.RyuApp):
 
             if self.status == GREEN: # Troca da topologia completa para a econômica
                 self.logger.info("%s Let's put %s to sleep", timestamp(), range(8, 11))
-                self.net    = self.red_net
-                self.status = RED
-                self.clean_tables()
+                self.set_status(RED)
             else: # Troca da topologia econômica para a completa
                 self.logger.info("%s Let's awake %s", timestamp(), range(8, 11))
-                self.net = self.green_net
-                self.status = GREEN
-                self.clean_tables()
+                self.set_status(GREEN)
+
+    def set_status(self, status):
+        """
+        Método responsável por realizar a troca de estado
+        """
+        with self.status_sem:
+            self.net.clear() # Limpa o grafo (para recalculá-lo no próximo PacketIn válido)
+            self.status = status # Altera o status
+            self.clean_tables() # Limpa as regras dos switches
 
     def clean_tables(self):
         """
@@ -179,7 +135,6 @@ class ProjectController(app_manager.RyuApp):
             # Limpa a cache de datapaths
             self.dps.clear()
 
-
     def add_flow(self, datapath, in_port, dst, actions):
         """
         Método responsável por adicionar um determinado fluxo em um switch.
@@ -189,6 +144,8 @@ class ProjectController(app_manager.RyuApp):
             dpid = datapath.id
             if not dpid in self.dps:
                 self.dps[dpid] = datapath
+
+            self.logger.info("%s adding entry for switch %s [dst: %s, port %s]", timestamp(), datapath.id, dst, in_port)
 
             # Monta a mensagem OpenFlow para adicionar o fluxo no switch,
             # informando a porta que o pacote deve ser enviado caso o destino
@@ -205,69 +162,129 @@ class ProjectController(app_manager.RyuApp):
                 flags=ofproto.OFPFF_SEND_FLOW_REM, actions=actions)
             datapath.send_msg(mod)
 
+    def drop_packet(self, msg):
+        """
+        Método responsável por determinar se o pacote que o switch recebeu
+        deve ser descartado por algum motivo
+        """
+        datapath = msg.datapath
+        pkt = packet.Packet(msg.data)
+        dpid = datapath.id
+
+        # Se a topologia está em modo econômico, ignora os switches
+        if self.status == RED and datapath.id in self.what_to_disable:
+            self.logger.info("%s (%s)I'm sleeping! %s", timestamp(), dpid, pkt)
+            return True
+
+        # Dropa pacotes IPv6
+        if pkt.get_protocol(ipv6.ipv6) or pkt.get_protocol(lldp.lldp):
+            self.logger.debug("%s Switch %s dropped non supported package %s", timestamp(), dpid, pkt)
+            return True
+
+        return False
+
+    def initialize_graph(self):
+        # Se ainda não conhece os switches, pega do controlador LLDP
+        if not self.switches:
+            lldp = self._lldp
+            lldp.close()
+            app_manager.unregister_app(lldp)
+            # Desabilita o controlador LLDP após não precisar mais dele
+
+            # Obtém os dados do controlador LLDP para gerar a topologia
+            switches = []
+            for dp in lldp.dps.itervalues():
+                switches.append(lldp._get_switch(dp.id))
+            self.logger.info("%s The following switches were found: %s", timestamp(), [s.dp.id for s in switches])
+            self.switches = switches
+            self.links = lldp.links
+            self.logger.info("%s The following %s links were found: %s", timestamp(), len(self.links), [(l.src.dpid, l.dst.dpid)  for l in self.links])
+
+        # Define os switches como nodos do grafo
+        switch_list = self.switches
+        if self.status == RED:
+            switch_list = filter(lambda s: s.dp.id not in self.what_to_disable, switch_list)
+        switches=[switch.dp.id for switch in switch_list]
+        self.net.add_nodes_from(switches)
+
+        # Define os links entre os switches como ligações entre os nodos do
+        # grafo, dando prioridade para os links para switches com dpid maior
+        links_list = self.links
+        if self.status == RED:
+            links_list = filter(lambda l: l.src.dpid not in self.what_to_disable, links_list)
+            links_list = filter(lambda l: l.dst.dpid not in self.what_to_disable, links_list)
+        links=[(link.src.dpid,link.dst.dpid,{'port':link.src.port_no, "priority":len(switches)-link.dst.dpid+1}) for link in links_list]
+        self.net.add_edges_from(links)
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         """
-        Método responsável por tratar pacotes do tipo PacketIn:w
+        Método responsável por tratar pacotes do tipo PacketIn
         """
-        msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
+        with self.status_sem:
+            msg = ev.msg
 
-        pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocol(ethernet.ethernet)
-
-        dst = eth.dst
-        src = eth.src
-        dpid = datapath.id
-
-        # Dropa pacotes IPv6
-        if pkt.get_protocol(ipv6.ipv6):
-            return None
-
-        # Se for um pacote ARP, aprende o endereço da fonte
-        arp_pkt = pkt.get_protocol(arp.arp)
-        if arp_pkt:
-            self.logger.info("ARP RECIEVED")
-            self.arp_table[arp_pkt.src_ip] = src  # ARP learning
-
-        # Se o endereço da fonte ainda não está presente no grafo, adiciona o
-        # mesmo, com um caminho para o switch atual
-        if src not in self.net:
-            self.logger.info("%s >> %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
-            self.net.add_node(src)
-            self.net.add_edge(dpid,src,{'port':msg.in_port})
-            self.net.add_edge(src,dpid)
-
-        # Se o endereço do destino está presente no grafo, calcula o menor
-        # caminho e determina a porta que o pacote deve ser enviado
-        if dst in self.net:
-            self.logger.info("%s << %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
-
-            self.net.edges()
-            path=nx.shortest_path(self.net,dpid,dst)
-            next=path[1]
-            out_port=self.net[dpid][next]['port']
-        else:
-            # Se o pacote for ARP, trata o mesmo de forma especial
-            if self.arp_handler(msg):  # True: reply ou drop;  False: flood
+            # Descarta o pacote, se necessário (ver método para mais informações)
+            if self.drop_packet(msg):
                 return None
-            else: # Senão, flood
-                self.logger.info("%s FLOOD %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
-                out_port = ofproto.OFPP_FLOOD
 
-        # Determina a(s) porta(s) que o pacote vai seguir))
-        actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+            datapath = msg.datapath
+            ofproto = datapath.ofproto
 
-        # Se não for flood, adiciona o fluxo no switch
-        if out_port != ofproto.OFPP_FLOOD:
-            self.add_flow(datapath, msg.in_port, dst, actions)
+            pkt = packet.Packet(msg.data)
+            eth = pkt.get_protocol(ethernet.ethernet)
 
-        # Repassa a mensagem
-        out = datapath.ofproto_parser.OFPPacketOut(
-            datapath=datapath, buffer_id=msg.buffer_id, in_port=msg.in_port,
-            actions=actions)
-        datapath.send_msg(out)
+            dst = eth.dst
+            src = eth.src
+            dpid = datapath.id
+
+            # Se for um pacote ARP, aprende o endereço da fonte
+            arp_pkt = pkt.get_protocol(arp.arp)
+            if arp_pkt:
+                self.logger.info("%s New ARP entry: [src: %s, %s]", timestamp(), arp_pkt.src_ip, src)
+                self.arp_table[arp_pkt.src_ip] = src  # ARP learning
+
+            # Inicializa o grafo se ele está vazio
+            if not self.net.nodes():
+                self.initialize_graph()
+
+            # Se o endereço da fonte ainda não está presente no grafo, adiciona o
+            # mesmo, com um caminho para o switch atual
+            if src not in self.net:
+                self.logger.info("%s >> %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
+                self.net.add_node(src)
+                self.net.add_edge(dpid,src,{'port':msg.in_port})
+                self.net.add_edge(src,dpid)
+
+            # Se o endereço do destino está presente no grafo, calcula o menor
+            # caminho e determina a porta que o pacote deve ser enviado
+            if dst in self.net:
+                self.logger.info("%s << %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
+
+                self.net.edges()
+                path=nx.shortest_path(self.net,dpid,dst, "priority")
+                next=path[1]
+                out_port=self.net[dpid][next]['port']
+            else:
+                # Se o pacote for ARP, trata o mesmo de forma especial
+                if self.arp_handler(msg):  # True: reply ou drop;  False: flood
+                    return None
+                else: # Senão, flood
+                    self.logger.info("%s FLOOD %010d %s %s %s %s", timestamp(), msg.buffer_id, src, dst, dpid, msg.in_port)
+                    out_port = ofproto.OFPP_FLOOD
+
+            # Determina a(s) porta(s) que o pacote vai seguir))
+            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+
+            # Se não for flood, adiciona o fluxo no switch
+            if out_port != ofproto.OFPP_FLOOD:
+                self.add_flow(datapath, msg.in_port, dst, actions)
+
+            # Repassa a mensagem
+            out = datapath.ofproto_parser.OFPPacketOut(
+                datapath=datapath, buffer_id=msg.buffer_id, in_port=msg.in_port,
+                actions=actions)
+            datapath.send_msg(out)
 
     def arp_handler(self, msg):
         datapath = msg.datapath
@@ -289,6 +306,8 @@ class ProjectController(app_manager.RyuApp):
 
             if (datapath.id, eth_src, arp_dst_ip) in self.sw:
                 if self.sw[(datapath.id, eth_src, arp_dst_ip)] != in_port:
+                    self.logger.info("%s ARP drop on switch: %s ; SRC: %s ; DST: %s ; PORT : %s",
+                                    timestamp(), datapath.id, eth_src, arp_dst_ip, in_port)
                     datapath.send_packet_out(in_port=in_port, actions=[])
                     return True
             else:
@@ -303,6 +322,8 @@ class ProjectController(app_manager.RyuApp):
             if opcode == arp.ARP_REQUEST:
                 # Procura na tabela IP-MAC
                 if arp_dst_ip in self.arp_table:
+                    self.logger.info("%s ARP reply on switch: %s ; SRC: %s ; DST: %s ; PORT : %s",
+                                    timestamp(), datapath.id, eth_src, arp_dst_ip, in_port)
                     actions = [parser.OFPActionOutput(in_port)]
                     # Monta o pacote ARP para responder
                     ARP_Reply = packet.Packet()
